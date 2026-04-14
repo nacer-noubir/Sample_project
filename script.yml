@@ -4,66 +4,67 @@ set -euo pipefail
 #──────────────────────────────────────────────
 # build-local.sh
 # Parse variables.yml and run docker build
+# Compatible: macOS (zsh/bash 3.x), Linux
 #──────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 VARS_FILE="${SCRIPT_DIR}/variables.yml"
 DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
 
 # ── Check required files ──
 for f in "$VARS_FILE" "$DOCKERFILE"; do
-  if [[ ! -f "$f" ]]; then
+  if [ ! -f "$f" ]; then
     echo "❌ Missing: $f"
     exit 1
   fi
 done
 
 # ── Parse variables.yml (simple key: value format) ──
-# Skips comments, blank lines, and section headers (lines ending with ':')
 echo "📄 Loading variables from $VARS_FILE"
 
-declare -A VARS
+BUILD_ARGS=""
+_IMAGE_NAME=""
+_IMAGE_TAG=""
 
-while IFS= read -r line; do
+while IFS= read -r line || [ -n "$line" ]; do
   # Skip comments and blank lines
-  [[ "$line" =~ ^[[:space:]]*# ]] && continue
-  [[ -z "${line// }" ]] && continue
+  case "$line" in
+    \#*|"") continue ;;
+  esac
 
-  # Match KEY: VALUE (handles quoted and unquoted values)
-  if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*:[[:space:]]*(.*)[[:space:]]*$ ]]; then
-    key="${BASH_REMATCH[1]}"
-    value="${BASH_REMATCH[2]}"
+  # Match KEY: VALUE
+  key=$(echo "$line" | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*:[[:space:]]*\(.*\)/\1/p')
+  value=$(echo "$line" | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*:[[:space:]]*\(.*\)/\2/p')
 
-    # Strip surrounding quotes if present
-    value="${value#\"}"
-    value="${value%\"}"
-    value="${value#\'}"
-    value="${value%\'}"
+  [ -z "$key" ] && continue
 
-    VARS["$key"]="$value"
-    export "$key"="$value"
-    echo "   $key=$value"
-  fi
+  # Strip surrounding quotes and trailing whitespace
+  value=$(echo "$value" | sed "s/^['\"]//;s/['\"]$//;s/[[:space:]]*$//")
+
+  export "$key"="$value"
+  echo "   $key=$value"
+
+  BUILD_ARGS="$BUILD_ARGS --build-arg ${key}=${value}"
+
+  # Capture image name/tag if present
+  [ "$key" = "IMAGE_NAME" ] && _IMAGE_NAME="$value"
+  [ "$key" = "IMAGE_TAG" ]  && _IMAGE_TAG="$value"
+
 done < "$VARS_FILE"
 
-# ── Build image name / tag from variables (adapt to your naming) ──
-IMAGE_NAME="${IMAGE_NAME:-${VARS[IMAGE_NAME]:-airflow-custom}}"
-IMAGE_TAG="${IMAGE_TAG:-${VARS[IMAGE_TAG]:-latest}}"
+# ── Build image name / tag ──
+IMAGE_NAME="${IMAGE_NAME:-${_IMAGE_NAME:-airflow-custom}}"
+IMAGE_TAG="${IMAGE_TAG:-${_IMAGE_TAG:-latest}}"
 FULL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
-
-# ── Construct docker build command ──
-BUILD_ARGS=()
-for key in "${!VARS[@]}"; do
-  BUILD_ARGS+=(--build-arg "${key}=${VARS[$key]}")
-done
 
 echo ""
 echo "🐳 Building image: $FULL_IMAGE"
 echo "   Context: $SCRIPT_DIR"
 echo ""
 
+# shellcheck disable=SC2086
 docker build \
-  "${BUILD_ARGS[@]}" \
+  $BUILD_ARGS \
   -t "$FULL_IMAGE" \
   -f "$DOCKERFILE" \
   "$SCRIPT_DIR"
@@ -71,5 +72,5 @@ docker build \
 echo ""
 echo "✅ Image built: $FULL_IMAGE"
 echo ""
-echo "Verify with:  docker images | grep $IMAGE_NAME"
-echo "Run with:     docker run --rm -it $FULL_IMAGE bash"
+echo "Verify:  docker images | grep $IMAGE_NAME"
+echo "Run:     docker run --rm -it $FULL_IMAGE bash"
