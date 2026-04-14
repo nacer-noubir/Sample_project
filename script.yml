@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#──────────────────────────────────────────────
+#──────────────────────────────────────────────────────
 # build-local.sh
-# Parse variables.yml and run docker build
+# Parse GitLab CI variables.yml and run docker build
 # Compatible: macOS (zsh/bash 3.x), Linux
-#──────────────────────────────────────────────
+#
+# Usage:
+#   ./build-local.sh                  # build
+#   DRY_RUN=true ./build-local.sh     # preview only
+#──────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 VARS_FILE="${SCRIPT_DIR}/variables.yml"
 DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
+DRY_RUN="${DRY_RUN:-false}"
 
 # ── Check required files ──
 for f in "$VARS_FILE" "$DOCKERFILE"; do
@@ -19,58 +24,101 @@ for f in "$VARS_FILE" "$DOCKERFILE"; do
   fi
 done
 
-# ── Parse variables.yml (simple key: value format) ──
-echo "📄 Loading variables from $VARS_FILE"
+# ── Temp files ──
+ARGS_FILE=$(mktemp)
+RESOLVED_VARS=$(mktemp)
+trap 'rm -f "$ARGS_FILE" "$RESOLVED_VARS"' EXIT
 
-BUILD_ARGS=""
-_IMAGE_NAME=""
-_IMAGE_TAG=""
+echo "📄 Parsing variables from $VARS_FILE"
+echo ""
 
+# ── Pass 1: Extract key=value ──
 while IFS= read -r line || [ -n "$line" ]; do
-  # Skip comments and blank lines
-  case "$line" in
-    \#*|"") continue ;;
-  esac
+  trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
 
-  # Match KEY: VALUE
-  key=$(echo "$line" | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*:[[:space:]]*\(.*\)/\1/p')
-  value=$(echo "$line" | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*:[[:space:]]*\(.*\)/\2/p')
+  case "$trimmed" in
+    ""|\#*) continue ;;
+  esac
+  echo "$trimmed" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*$' && continue
+
+  key=$(echo "$trimmed" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*:[[:space:]]*\(.*\)/\1/p')
+  value=$(echo "$trimmed" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*:[[:space:]]*\(.*\)/\2/p')
 
   [ -z "$key" ] && continue
 
-  # Strip surrounding quotes and trailing whitespace
   value=$(echo "$value" | sed "s/^['\"]//;s/['\"]$//;s/[[:space:]]*$//")
+  [ -z "$value" ] && continue
 
-  export "$key"="$value"
-  echo "   $key=$value"
-
-  BUILD_ARGS="$BUILD_ARGS --build-arg ${key}=${value}"
-
-  # Capture image name/tag if present
-  [ "$key" = "IMAGE_NAME" ] && _IMAGE_NAME="$value"
-  [ "$key" = "IMAGE_TAG" ]  && _IMAGE_TAG="$value"
+  echo "${key}=${value}" >> "$RESOLVED_VARS"
 
 done < "$VARS_FILE"
 
-# ── Build image name / tag ──
-IMAGE_NAME="${IMAGE_NAME:-${_IMAGE_NAME:-airflow-custom}}"
-IMAGE_TAG="${IMAGE_TAG:-${_IMAGE_TAG:-latest}}"
-FULL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+# ── Pass 2: Resolve variable references ($VAR / ${VAR}) ──
+resolve_vars() {
+  local result="$1"
+  while IFS='=' read -r k v; do
+    [ -z "$k" ] && continue
+    result=$(echo "$result" | sed "s|\${${k}}|${v}|g")
+    result=$(echo "$result" | sed "s|\$${k}|${v}|g")
+  done < "$RESOLVED_VARS"
+  echo "$result"
+}
+
+for _pass in 1 2 3; do
+  TEMP_RESOLVED=$(mktemp)
+  while IFS='=' read -r key value; do
+    [ -z "$key" ] && continue
+    resolved=$(resolve_vars "$value")
+    echo "${key}=${resolved}" >> "$TEMP_RESOLVED"
+  done < "$RESOLVED_VARS"
+  mv "$TEMP_RESOLVED" "$RESOLVED_VARS"
+done
+
+# ── Display and export ──
+COUNT=0
+
+while IFS='=' read -r key value; do
+  [ -z "$key" ] && continue
+  echo "   ✓ $key=$value"
+  export "$key"="$value"
+  echo "--build-arg" >> "$ARGS_FILE"
+  printf '%s=%s\n' "$key" "$value" >> "$ARGS_FILE"
+  COUNT=$((COUNT + 1))
+done < "$RESOLVED_VARS"
+
+echo ""
+echo "   Loaded $COUNT variables"
+
+# ── Build image name ──
+DOCKER_IMAGE_TO_BUILD="${DOCKER_IMAGE_TO_BUILD:-airflow-custom}"
+BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-latest}"
+FULL_IMAGE="${DOCKER_IMAGE_TO_BUILD}:${BASE_IMAGE_TAG}"
 
 echo ""
 echo "🐳 Building image: $FULL_IMAGE"
 echo "   Context: $SCRIPT_DIR"
 echo ""
 
-# shellcheck disable=SC2086
-docker build \
-  $BUILD_ARGS \
+if [ "$DRY_RUN" = "true" ]; then
+  echo "🔍 DRY RUN — command that would be executed:"
+  echo ""
+  echo "docker build \\"
+  while IFS= read -r arg; do
+    echo "  $arg \\"
+  done < "$ARGS_FILE"
+  echo "  -t $FULL_IMAGE \\"
+  echo "  -f $DOCKERFILE \\"
+  echo "  $SCRIPT_DIR"
+  exit 0
+fi
+
+xargs docker build \
   -t "$FULL_IMAGE" \
   -f "$DOCKERFILE" \
-  "$SCRIPT_DIR"
+  "$SCRIPT_DIR" < "$ARGS_FILE"
 
 echo ""
 echo "✅ Image built: $FULL_IMAGE"
 echo ""
-echo "Verify:  docker images | grep $IMAGE_NAME"
-echo "Run:     docker run --rm -it $FULL_IMAGE bash"
+echo "Verify:  docker images | grep ${DOCKER_IMAGE_TO_BUILD}"
+echo "Run:     docker run --rm -it ${FULL_IMAGE} bash"
