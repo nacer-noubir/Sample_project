@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#──────────────────────────────────────────────
+# build-local.sh
+# Parse variables.yml and run docker build
+#──────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VARS_FILE="${SCRIPT_DIR}/variables.yml"
+DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
+
+# ── Check required files ──
+for f in "$VARS_FILE" "$DOCKERFILE"; do
+  if [[ ! -f "$f" ]]; then
+    echo "❌ Missing: $f"
+    exit 1
+  fi
+done
+
+# ── Parse variables.yml (simple key: value format) ──
+# Skips comments, blank lines, and section headers (lines ending with ':')
+echo "📄 Loading variables from $VARS_FILE"
+
+declare -A VARS
+
+while IFS= read -r line; do
+  # Skip comments and blank lines
+  [[ "$line" =~ ^[[:space:]]*# ]] && continue
+  [[ -z "${line// }" ]] && continue
+
+  # Match KEY: VALUE (handles quoted and unquoted values)
+  if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*:[[:space:]]*(.*)[[:space:]]*$ ]]; then
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+
+    # Strip surrounding quotes if present
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
+
+    VARS["$key"]="$value"
+    export "$key"="$value"
+    echo "   $key=$value"
+  fi
+done < "$VARS_FILE"
+
+# ── Build image name / tag from variables (adapt to your naming) ──
+IMAGE_NAME="${IMAGE_NAME:-${VARS[IMAGE_NAME]:-airflow-custom}}"
+IMAGE_TAG="${IMAGE_TAG:-${VARS[IMAGE_TAG]:-latest}}"
+FULL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+
+# ── Construct docker build command ──
+BUILD_ARGS=()
+for key in "${!VARS[@]}"; do
+  BUILD_ARGS+=(--build-arg "${key}=${VARS[$key]}")
+done
+
+echo ""
+echo "🐳 Building image: $FULL_IMAGE"
+echo "   Context: $SCRIPT_DIR"
+echo ""
+
+docker build \
+  "${BUILD_ARGS[@]}" \
+  -t "$FULL_IMAGE" \
+  -f "$DOCKERFILE" \
+  "$SCRIPT_DIR"
+
+echo ""
+echo "✅ Image built: $FULL_IMAGE"
+echo ""
+echo "Verify with:  docker images | grep $IMAGE_NAME"
+echo "Run with:     docker run --rm -it $FULL_IMAGE bash"
